@@ -201,21 +201,24 @@ class XiaomiTV(MediaPlayerEntity):
             else:
                 await changesource(self.ip, sound_mode)
 
+    # ── 电源键 ──────────────────────────────────────────────────────────────
+    # iOS 遥控器/家庭 App 的电源键走的是 HomeKit 的 Active 特征，HA 会把它翻成
+    # media_player.turn_on / turn_off（不会抛 homekit_tv_remote_key_pressed 事件）。
+    # 这两个方法以前用 `if self._state != STATE_OFF/STATE_ON` 做守卫，但本集成的
+    # 状态是"轮询 6095 端口通不通"猜出来的、恒为 playing，一旦猜错就会把按键整个
+    # 吞掉（用户按了电源键却什么都没发生），所以这里改成**无条件发 power**。
+    # power 是翻转键（开着就关、关着就开），所以两个方向都发同一个键是对的。
     async def async_turn_off(self):
-        if self._state != STATE_OFF:
-            self._state = STATE_OFF
-            await keyevent(self.ip, 'power')
-            self.fire_event('off')
+        self._state = STATE_OFF
+        _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
+        await keyevent(self.ip, 'power')
+        self.fire_event('off')
 
     async def async_turn_on(self):
-        if self._state != STATE_ON:
-            self.fire_event('on')
-            self._state = STATE_ON
-            # HomeKit 遥控器的电源键走的是 Active 特征 -> media_player.turn_on / turn_off，
-            # 不会抛 homekit_tv_remote_key_pressed 事件（蓝图里配不出电源键）。
-            # 所以开机方向也必须在集成里把 power 发出去，和 async_turn_off 对称。
-            # power 是翻转键，电视待机（6095 端口仍在线）时能唤醒。
-            await keyevent(self.ip, 'power')
+        self._state = STATE_ON
+        _LOGGER.warning('[调试] 收到电源键 -> turn_on，发送 keyevent power')
+        await keyevent(self.ip, 'power')
+        self.fire_event('on')
 
     # 发送事件
     def fire_event(self, cmd):
