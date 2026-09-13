@@ -1,6 +1,6 @@
 blueprint:
   name: iOS电视遥控
-  description: iOS系统电视遥控器
+  description: iOS系统电视遥控器（HomeKit 遥控器按键透传到小米电视）。注意：遥控器上的电源键不产生按键事件，它走 HomeKit 的 Active 特征，由集成直接调用开关机。
   domain: automation
   source_url: https://github.com/shaonianzhentan/xiaomi_tv
   input:
@@ -12,26 +12,40 @@ blueprint:
         entity:
           integration: xiaomi_tv
           domain: media_player
+
+# HomeKit 遥控器按键 -> 小米电视按键
+# 可用的 key_name 只有这些：arrow_up/arrow_down/arrow_left/arrow_right/select/
+# back/exit/information/play_pause/next_track/previous_track/fast_forward/rewind
+variables:
+  key_name: "{{ trigger.event.data.key_name }}"
+  key_map:
+    arrow_up: up
+    arrow_down: down
+    arrow_left: left
+    arrow_right: right
+    select: enter
+    play_pause: enter
+    back: back
+    exit: back
+    information: menu
+    next_track: right
+    previous_track: left
+    fast_forward: right
+    rewind: left
+
 trigger:
 - platform: event
   event_type: homekit_tv_remote_key_pressed
   event_data:
     entity_id: !input media_entity
+
+# 未映射的按键直接忽略，避免模板报错
+condition:
+- condition: template
+  value_template: "{{ key_name in key_map }}"
+
 action:
 - service: xiaomi_tv.send_key
-  data:    
+  data:
     entity_id: !input media_entity
-    key: >
-      {% set name = trigger.event.data.key_name %}
-      {% set keys = {
-            "arrow_up": "up",
-            "arrow_down": "down",
-            "arrow_left": "left",
-            "arrow_right": "right",
-            "select": "enter",
-            "play_pause": "enter",
-            "back": "back",
-            "information": "menu"
-          } 
-      %}
-      {{keys[name]}}
+    key: "{{ key_map[key_name] }}"

@@ -25,12 +25,19 @@ from homeassistant.const import (
 )
 
 from .manifest import manifest
-from .const import DOMAIN
+from .const import DOMAIN, CONF_TURN_ON_ENTITY
 from .utils import keyevent, startapp, check_port, getsysteminfo, changesource, getinstalledapp, capturescreen, open_app
 from .dlna import MediaDLNA
 from .adb import MediaADB
 
 _LOGGER = logging.getLogger(__name__)
+
+# 没配置「开机开关实体」时的兜底开机方式：
+#   True : 用局域网遥控接口发送 power 按键（小米电视待机时 6095 端口仍在线即可唤醒）
+#   False: 不发送按键，只抛出 xiaomi_tv 的 on 事件，由 xiaomi_tv.yaml 蓝图调用红外、
+#          小爱音箱等外部方式开机
+# 关机始终走电视自身的局域网关机逻辑，不受这里影响。
+TURN_ON_BY_KEY = True
 
 SUPPORT_XIAOMI_TV = (
   MediaPlayerEntityFeature.VOLUME_STEP 
@@ -56,18 +63,21 @@ async def async_setup_entry(
     config = entry.options
     host = config.get('ip')
     name = config.get(CONF_NAME)
+    turn_on_entity = config.get(CONF_TURN_ON_ENTITY)
     if host is not None:
-        async_add_entities([XiaomiTV(entry.entry_id, host, name)], True)
+        async_add_entities([XiaomiTV(entry.entry_id, host, name, turn_on_entity)], True)
 
 class XiaomiTV(MediaPlayerEntity):
     """Represent the Xiaomi TV for Home Assistant."""
 
-    def __init__(self, entry_id, ip, name):
-        
+    def __init__(self, entry_id, ip, name, turn_on_entity=None):
+
         self._attr_unique_id = entry_id
-    
+
         self.ip = ip
         self._attr_name = name
+        # 开机时打开的开关实体（智能插座/虚拟开关等），为空则用局域网 power 按键
+        self._turn_on_entity = turn_on_entity
         self._attr_media_title = name
         self._volume_level = 1
         self._is_volume_muted = False
@@ -105,7 +115,8 @@ class XiaomiTV(MediaPlayerEntity):
         # mitv ethernet Mac address
         self._attr_extra_state_attributes = {
             'platform': 'xiaomi',
-            'ip': self.ip
+            'ip': self.ip,
+            CONF_TURN_ON_ENTITY: self._turn_on_entity
         }
         # 失败计数器
         self.fail_count = 0
@@ -201,16 +212,32 @@ class XiaomiTV(MediaPlayerEntity):
             else:
                 await changesource(self.ip, sound_mode)
 
+    # 关机：始终走电视自身的关机逻辑（局域网 power 按键）
+    # iOS 遥控器电源键、HA 里的开关都会走到这里
     async def async_turn_off(self):
         if self._state != STATE_OFF:
             self._state = STATE_OFF
             await keyevent(self.ip, 'power')
+            # 抛事件：如果是小米盒子，可以在蓝图里补一条"关普通电视"的动作
             self.fire_event('off')
 
+    # 开机：优先打开配置的开关实体，没配置时才走兜底方式
+    # iOS 遥控器电源键、HA 里的开关都会走到这里
     async def async_turn_on(self):
         if self._state != STATE_ON:
-            self.fire_event('on')
             self._state = STATE_ON
+            if self._turn_on_entity:
+                # 配置了开关实体：交给它去开机（智能插座、虚拟开关、脚本等）
+                await self.hass.services.async_call(
+                    'homeassistant', 'turn_on',
+                    { 'entity_id': self._turn_on_entity }
+                )
+            elif TURN_ON_BY_KEY:
+                # 没配置开关实体：用局域网 power 按键唤醒
+                await keyevent(self.ip, 'power')
+            else:
+                # 也没法局域网唤醒：抛事件，由 xiaomi_tv.yaml 蓝图接管
+                self.fire_event('on')
 
     # 发送事件
     def fire_event(self, cmd):
