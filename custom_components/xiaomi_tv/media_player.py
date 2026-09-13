@@ -211,6 +211,11 @@ class XiaomiTV(MediaPlayerEntity):
         if self._state != STATE_ON:
             self.fire_event('on')
             self._state = STATE_ON
+            # HomeKit 遥控器的电源键走的是 Active 特征 -> media_player.turn_on / turn_off，
+            # 不会抛 homekit_tv_remote_key_pressed 事件（蓝图里配不出电源键）。
+            # 所以开机方向也必须在集成里把 power 发出去，和 async_turn_off 对称。
+            # power 是翻转键，电视待机（6095 端口仍在线）时能唤醒。
+            await keyevent(self.ip, 'power')
 
     # 发送事件
     def fire_event(self, cmd):
@@ -255,19 +260,31 @@ class XiaomiTV(MediaPlayerEntity):
             self._attr_media_content_id = media_id
             await self.dlna.async_play_media(media_type, media_id)
 
+    # ── iOS 遥控器的「播放/暂停」键 = 电视的「主页」键 ──────────────────────
+    # HomeKit 不会把这些按键抛成 homekit_tv_remote_key_pressed 事件：
+    # TelevisionMediaPlayer.set_remote_key() 里，只要实体声明了 PLAY|PAUSE
+    # （本集成声明了），play_pause 就会被直接翻译成 media_player 服务调用：
+    #     状态 playing  -> media_player.media_pause -> async_media_pause()
+    #     状态 paused   -> media_player.media_play  -> async_media_play()
+    #     其它状态      -> media_player.media_play_pause -> async_media_play_pause()
+    #     且之后直接 return，永远不抛事件。
+    # 所以蓝图里的 play_pause 映射是死代码，真正生效的是下面这三处兜底。
     async def async_media_play(self):
         result = await self.dlna.async_media_play()
         if result:
             self._state = STATE_PLAYING
         else:
-            await keyevent(self.ip, 'enter')
+            await keyevent(self.ip, 'home')
 
     async def async_media_pause(self):
         result = await self.dlna.async_media_pause()
         if result:
             self._state = STATE_PAUSED
         else:
-            await keyevent(self.ip, 'enter')
+            await keyevent(self.ip, 'home')
+
+    async def async_media_play_pause(self):
+        await keyevent(self.ip, 'home')
 
     async def async_media_next_track(self):
         await keyevent(self.ip, 'right')

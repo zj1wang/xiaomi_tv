@@ -1,6 +1,11 @@
 blueprint:
   name: iOS电视遥控
-  description: iOS系统电视遥控器
+  description: >
+    iOS 遥控器的方向键/确认/返回/信息透传到小米电视。
+    注意：遥控器上的「播放-暂停」和「电源」键不会产生按键事件 ——
+    play_pause 会被 HA 翻译成 media_player.media_pause / media_play，
+    电源键走 Active 特征变成 media_player.turn_on / turn_off，
+    两者都由集成内部直接发按键，不需要也不应该在这里配置。
   domain: automation
   source_url: https://github.com/shaonianzhentan/xiaomi_tv
   input:
@@ -17,6 +22,14 @@ trigger:
   event_type: homekit_tv_remote_key_pressed
   event_data:
     entity_id: !input media_entity
+# 未列出的按键（exit / next_track / fast_forward / rewind 等）直接忽略，
+# 否则下面的模板会抛 UndefinedError（HA 的模板用的是 StrictUndefined）。
+condition:
+- condition: template
+  value_template: >
+    {{ trigger.event.data.key_name in
+       ['arrow_up', 'arrow_down', 'arrow_left', 'arrow_right',
+        'select', 'play_pause', 'back', 'information'] }}
 action:
 - service: xiaomi_tv.send_key
   data:    
@@ -29,7 +42,7 @@ action:
             "arrow_left": "left",
             "arrow_right": "right",
             "select": "enter",
-            "play_pause": "enter",
+            "play_pause": "home",
             "back": "back",
             "information": "menu"
           } 

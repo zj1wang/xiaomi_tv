@@ -40,8 +40,24 @@ HomeKit遥控器
 ```yaml
 service: xiaomi_tv.send_key
 data:
-  command: left
+  key: left
 ```
+
+### iOS 遥控器（HomeKit）的按键映射
+
+遥控器上不同类型的按键，在 Home Assistant 里走的是完全不同的链路：
+
+| 遥控器按键 | HomeKit 特征 | 实际动作 |
+|---|---|---|
+| 方向 / 确认 / 返回 / 信息 | `RemoteKey` → 抛 `homekit_tv_remote_key_pressed` 事件 | 「iOS电视遥控」蓝图 → `xiaomi_tv.send_key` |
+| 播放-暂停 | 被 HA 拦成 `media_player.media_pause` / `media_play` | 发 `keyevent&keycode=home`（电视回主页） |
+| 电源 | `Active` → `media_player.turn_on` / `turn_off` | 发 `keyevent&keycode=power` |
+
+> 播放-暂停和电源键**都不会抛 `homekit_tv_remote_key_pressed` 事件**，
+> 所以在蓝图里配不出来，只能由集成内部处理。
+> 原因是 `TelevisionMediaPlayer.set_remote_key()` 里对
+> `play_pause` 做了特判（只要实体声明了 `PLAY|PAUSE` 就直接调服务并 `return`），
+> 而电源键压根不走 `RemoteKey` 特征。
 
 ## ADB服务
 
