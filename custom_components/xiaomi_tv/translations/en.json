@@ -17,11 +17,7 @@
                 "description": "选择当前局域网中的小米电视设备",
                 "data": {
                     "name": "名称",
-                    "ip": "IP",
-                    "turn_on_entity": "开机开关实体"
-                },
-                "data_description": {
-                    "turn_on_entity": "可选。点电源键开机时改为打开这个开关实体（智能插座、虚拟开关、脚本等）；关机仍然走电视自身的关机逻辑。留空则用局域网 power 按键开机。"
+                    "ip": "IP"
                 }
             }
         },
