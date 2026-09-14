@@ -71,13 +71,7 @@ class XiaomiTV(MediaPlayerEntity):
         self._attr_media_title = name
         self._volume_level = 1
         self._is_volume_muted = False
-        # ⚠️ 初始值不能是 off。HA 的 HomeKit 用
-        #   `state in (off, unknown, standby, "None")` 决定 Active 特征，
-        # 报成 off 就会让 iOS 下一次按电源键发 Active=1 → turn_on，
-        # 而 turn_on 按设计不发按键（见下面 async_turn_on 的说明），
-        # 于是"每隔一次按电源键就没反应"。保持非 off 才能让每次按键都走
-        # turn_off → 发 power。
-        self._state = STATE_ON
+        self._state = STATE_OFF
         self._source_list = []
         self._sound_mode_list = ['hdmi1', 'hdmi2', 'hdmi3', 'gallery', 'aux', 'tv', 'vga', 'av', 'dtmb', 'adb']
         # DLNA媒体设备
@@ -220,15 +214,8 @@ class XiaomiTV(MediaPlayerEntity):
     # （待机时 6095 端口照样在线，见 docs/mitv-6095-api.md 第五节）。
     # 所以只有"关"这个方向能发按键，"开"这个方向只能交给外部
     # （拿下面 fire_event('on') 抛的 xiaomi_tv 事件去接智能插座/小爱）。
-    #
-    # ⚠️ 由此推出第二条规则：**这个实体永远不能把状态报成 off**
-    # （off / unknown / standby 都会让 Active 变 0）。因为一旦报成 off，
-    # iOS 下一次按电源键发的是 Active=1 → turn_on，而 turn_on 按设计不发按键
-    # → 症状是"每隔一次按电源键就没反应"。保持 Active 恒为 1，
-    # 每次按电源键才会走 turn_off → 发 power → 电视翻转。
-    # （原来靠每 30s 轮询把状态刷回 playing 掩盖了这个问题，轮询删掉后就暴露了。）
     async def async_turn_off(self):
-        # 只发按键，**不动 _state**（理由见上面第二条规则）
+        self._state = STATE_OFF
         _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
         await keyevent(self.ip, 'power')
         self.fire_event('off')
@@ -325,9 +312,8 @@ class XiaomiTV(MediaPlayerEntity):
     # 进而触发 iOS「第一次操作遥控器时补发 Active=1」的行为。
     #
     # 现在 _state 只由我们自己的动作维护，别的什么都不改它：
-    #   __init__()                         -> STATE_ON（不能是 off，见电源键那段）
     #   async_turn_on()                    -> STATE_ON
-    #   async_turn_off()                   -> 不改（必须保持非 off，见电源键那段）
+    #   async_turn_off()                   -> STATE_OFF
     #   async_media_play() / _pause()      -> STATE_PLAYING / STATE_PAUSED
     # 电视真实的开关机状态不可知，这也是 assumed_state = True 的意思。
     async def async_update(self):
