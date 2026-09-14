@@ -37,7 +37,7 @@ async def keyevent(ip, keycode):
 async def getsysteminfo(ip):
     res = await mitv_api(ip, f'controller?action=getsysteminfo')
     if res is not None:
-        return res['data']
+        return res.get('data')
 
 # 发送按键
 async def changesource(ip, source):
@@ -46,8 +46,10 @@ async def changesource(ip, source):
 # 获取安装应用
 async def getinstalledapp(ip):
     res = await mitv_api(ip, f'controller?action=getinstalledapp&count=999&changeIcon=1')
-    if res is not None:
-        return res['data']['AppInfo']       
+    # 电视关机 / 参数不合法时返回的是 {"status":0,"msg":"error","data":null}，
+    # 这里必须容忍 data 为 null，否则会抛 AttributeError/TypeError 把 async_update 打挂。
+    data = (res or {}).get('data') or {}
+    return data.get('AppInfo')
 
 
 ''' 电视截屏 '''
@@ -66,8 +68,9 @@ def with_opaque(pms, token=None):
 async def capturescreen(ip):
     params = with_opaque({'action': 'capturescreen', 'compressrate': 100})
     res = await mitv_api(ip, f'controller?{urlencode(params)}')
-    if res is not None:
-        rdt = res['data']
+    # 同上：电视关机时 data 是 null，rdt.get(...) 会直接炸
+    rdt = (res or {}).get('data')
+    if rdt:
         # 获取图片
         token = rdt.get('token')
         params = with_opaque({'action': 'getResource', 'name': 'screenCapture'}, token)

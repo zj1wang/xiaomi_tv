@@ -1,0 +1,153 @@
+# 小米电视 · iOS 遥控器（HomeKit）
+#
+# 结论先放前面：**遥控器的按键不需要任何自动化，配置只需要暴露 HomeKit。**
+# 所有按键都由集成自己发 6095 的 keyevent。
+# 如果你的 configuration.yaml 里还留着旧版本里那条
+# 「type: on 时补发 power」的自动化，请删掉，否则会连发两次 power 互相抵消。
+
+
+# ========================================================================
+# 按键是怎么落到电视上的（HA 官方行为，不是本项目的设计）
+# ========================================================================
+#
+#   遥控器按键            HomeKit 特征             Home Assistant 侧
+#   ─────────────────────────────────────────────────────────────────────
+#   方向 / 确认 / 返回 / 信息   RemoteKey  → 抛 homekit_tv_remote_key_pressed
+#                                              → 由「iOS电视遥控」蓝图转成
+#                                                xiaomi_tv.send_key
+#
+#   播放-暂停              RemoteKey  → **不抛事件**。因为实体声明了
+#                                       PLAY|PAUSE，HA 直接调
+#                                       media_player.media_pause / media_play
+#                                       → 集成里发 keyevent&keycode=home
+#
+#   电源                   Active     → media_player.turn_on / turn_off
+#                                       → 集成里发 keyevent&keycode=power
+#
+# 后两条都必须在集成内部实现，蓝图做不到 —— 这是 media_player.py 里
+# async_media_play / async_media_pause / async_media_play_pause /
+# async_turn_on / async_turn_off 那几处的职责。
+#
+# 补充：配件类型由 device_class 硬决定，配置改不了 ——
+#   accessories.py::get_accessory
+#     device_class ∈ (tv, receiver, projector) → TelevisionMediaPlayer（你的情况）
+#     其它 + feature_list 合法                    → MediaPlayer（一堆开关）
+#   所以 device_class: tv 时不可能退化成"开关型"，电源只能走 Active。
+
+
+# ========================================================================
+# HomeKit 暴露
+# ========================================================================
+homekit:
+  # ---- 必需：电视本体（遥控器方向键、确认、返回、播放-暂停、音量）----
+  - name: 小米电视
+    mode: accessory                        # 电视必须用 accessory 模式（HA 强制）
+    port: 21065                            # 不要和已有的 HomeKit 实例撞端口
+    filter:
+      include_entities:
+        - media_player.xiao_mi_dian_shi    # ← 换成你的电视实体
+    entity_config:
+      media_player.xiao_mi_dian_shi:
+        name: 小米电视
+
+  # ---- 可选：下面这个「电源开关」磁贴，不需要就整段删掉 ----
+  #
+  # 什么时候要它：如果验证下来 iOS 遥控器的电源键压根不产生任何面向 HA
+  # 的调用（见文件末尾的 homekit_state_change 测试），那这个电源键就救不回来了，
+  # 集成侧没有可挂钩的地方 —— 此时用这个开关代替。
+  #
+  # ⚠️ 代价：开关是另一种配件类型，只能走 bridge 模式，而且是一个新的
+  #    homekit 实例 → 需要换端口，并在家庭 App 里**再配对一次**。
+  - name: 小米电视电源
+    mode: bridge
+    port: 21066
+    filter:
+      include_entities:
+        - switch.dian_shi_dian_yuan
+
+# 可选开关本体（和上面第二个 homekit 实例配套；不用就一起删）
+# 原理：turn_on / turn_off 都发 keyevent power（翻转键），点一下 = 切一次电源。
+# 状态只能靠轮询猜，所以会一直显示"开"，和电视实体本身的老问题一样，不影响使用。
+switch:
+  - platform: template
+    switches:
+      dian_shi_dian_yuan:
+        friendly_name: 电视电源
+        unique_id: xiaomi_tv_power
+        value_template: "{{ is_state('media_player.xiao_mi_dian_shi', 'playing') }}"
+        turn_on:
+          - action: xiaomi_tv.send_key
+            data:
+              entity_id: media_player.xiao_mi_dian_shi
+              key: power
+        turn_off:
+          - action: xiaomi_tv.send_key
+            data:
+              entity_id: media_player.xiao_mi_dian_shi
+              key: power
+
+
+# ========================================================================
+# ⚠️ 别再加「电源键补发 power」的自动化
+# ========================================================================
+#
+# power 是翻转键：开着就关、关着就开。
+#
+# 集成里**只有 async_turn_off() 会发 power**；async_turn_on() 故意不发，原因是：
+# iOS 认为配件"关着"时，会在你按**任意**遥控器按键（哪怕是方向键）之前，
+# 先补一个 Active=1 把配件"唤醒" —— 而这时电视往往是开着的。
+# 此时发 power 就会把刚打开的电视关掉，也就是
+# 「打开电视后第一次按遥控器，电视自己关机了」这个 bug（2026-09-14 实测）。
+# 这两种场景在协议层**区分不了**（待机时 6095 端口照样在线），所以开的方向只能不发。
+#
+# ⇒ 千万别再加监听 xiaomi_tv 事件（type: "off"）去 send_key power 的自动化：
+#    一次按键会发两次 power → 翻转两次 = 看起来没反应。
+#   blueprints/xiaomi_tv.yaml 的「关闭电视」动作同理，别填 key: power。
+#   那个蓝图里的「打开电视」动作才是正当用途 —— 外接智能插座 / 小爱去开机。
+
+
+# ========================================================================
+# 状态显示说明（不影响按键）
+# ========================================================================
+# 集成判断开关状态靠的是「6095 端口通不通」，而电视待机（假关机）时端口仍在线，
+# 所以 HA 里的状态会一直显示成 playing → HomeKit 的 Active 恒为 1
+# → 点电源键始终走 turn_off 分支。
+#
+# 实际使用没问题：turn_off 发的是 power，而 power 是翻转键，
+# 所以按一下照样能开关电视，只是家庭 App 里状态显示永远停在「开着」。
+# 副作用：如果电视真的是关着的，你会看到磁贴显示"开着"，按一下是把它打开。
+
+
+# ========================================================================
+# 验证 / 排查
+# ========================================================================
+# 1) 直接确认电视收到了什么（浏览器打开，注意会真的按下去）：
+#      http://<电视IP>:6095/controller?action=keyevent&keycode=power
+#      http://<电视IP>:6095/controller?action=keyevent&keycode=home
+#    实测记录（2026-09-13）：power 返回 200/success 且电视真的关机；
+#    无效 keycode 返回 404/error。详见 docs/mitv-6095-api.md。
+#
+# 2) 想知道 HomeKit 到底往 HA 发了什么：
+#      开发者工具 → 事件 → 事件类型填 homekit_state_change → 开始监听
+#    ⚠️ 事件名就叫 homekit_state_change，**不是 homekit_changed** ——
+#      HA 源码里那个常量 `EVENT_HOMEKIT_CHANGED` 的值是 "homekit_state_change"
+#      （homekit/const.py:100）。别看常量名猜字符串，一定去 const.py 里对。
+#    HA 每次因 HomeKit 发起的调用都会抛这个事件，data 是：
+#      entity_id / display_name / service / value
+#      · 先做自检：按遥控器的播放-暂停键 → 应看到 service: media_pause
+#        （方向键不会出现在这里，它走的是 homekit_tv_remote_key_pressed）
+#      · 再按电源键 → 应该出现 service: turn_off 或 turn_on
+#      · 如果电源键在这里始终没有任何事件 → iOS 压根没写 Active 特征，
+#        那么用上面的「电视电源」开关代替，或者用仪表盘按钮 / 小爱。
+#
+#    更省事、且不依赖事件名的办法：直接在日志里看集成自己打的
+#    `[调试] 收到电源键 -> turn_on/turn_off`（见 media_player.py，
+#    以及上面第 3 条的 logger 配置）。日志里有 = 按键到 HA 了；
+#    一直没有 = 没到，问题在 iOS/HomeKit 侧。
+#
+# 3) 想看得更细（能把 pyhap 层被拒绝的写入也打出来）：
+#      logger:
+#        default: warning
+#        logs:
+#          homeassistant.components.homekit: debug
+#          custom_components.xiaomi_tv: debug

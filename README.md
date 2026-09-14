@@ -51,13 +51,19 @@ data:
 |---|---|---|
 | 方向 / 确认 / 返回 / 信息 | `RemoteKey` → 抛 `homekit_tv_remote_key_pressed` 事件 | 「iOS电视遥控」蓝图 → `xiaomi_tv.send_key` |
 | 播放-暂停 | 被 HA 拦成 `media_player.media_pause` / `media_play` | 发 `keyevent&keycode=home`（电视回主页） |
-| 电源 | `Active` → `media_player.turn_on` / `turn_off` | 发 `keyevent&keycode=power` |
+| 电源 | `Active` → `media_player.turn_off`（**只有这个方向**） | 发 `keyevent&keycode=power` |
 
 > 播放-暂停和电源键**都不会抛 `homekit_tv_remote_key_pressed` 事件**，
 > 所以在蓝图里配不出来，只能由集成内部处理。
 > 原因是 `TelevisionMediaPlayer.set_remote_key()` 里对
 > `play_pause` 做了特判（只要实体声明了 `PLAY|PAUSE` 就直接调服务并 `return`），
 > 而电源键压根不走 `RemoteKey` 特征。
+
+> ⚠️ **开机的方向故意不发按键**：`media_player.turn_on` 除了"用户想开机"，
+> 还会被 iOS 用来在按任意遥控器按键前"唤醒"它以为关着的配件 ——
+> 这时电视其实是开着的，发 `power`（翻转键）反而会把它关掉。
+> 两种场景在协议层区分不了（待机时 6095 照样在线），所以 `async_turn_on()`
+> 只抛 `xiaomi_tv` 的 `on` 事件，真正开机请用那个事件外接（智能插座 / 小爱）。
 
 ## ADB服务
 

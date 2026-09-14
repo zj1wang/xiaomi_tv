@@ -26,7 +26,7 @@ from homeassistant.const import (
 
 from .manifest import manifest
 from .const import DOMAIN
-from .utils import keyevent, startapp, check_port, getsysteminfo, changesource, getinstalledapp, capturescreen, open_app
+from .utils import keyevent, startapp, getsysteminfo, changesource, getinstalledapp, capturescreen, open_app
 from .dlna import MediaDLNA
 from .adb import MediaADB
 
@@ -72,7 +72,6 @@ class XiaomiTV(MediaPlayerEntity):
         self._volume_level = 1
         self._is_volume_muted = False
         self._state = STATE_OFF
-        self.is_alive = False
         self._source_list = []
         self._sound_mode_list = ['hdmi1', 'hdmi2', 'hdmi3', 'gallery', 'aux', 'tv', 'vga', 'av', 'dtmb', 'adb']
         # DLNA媒体设备
@@ -107,8 +106,6 @@ class XiaomiTV(MediaPlayerEntity):
             'platform': 'xiaomi',
             'ip': self.ip
         }
-        # 失败计数器
-        self.fail_count = 0
 
     @property
     def volume_level(self):
@@ -204,10 +201,19 @@ class XiaomiTV(MediaPlayerEntity):
     # ── 电源键 ──────────────────────────────────────────────────────────────
     # iOS 遥控器/家庭 App 的电源键走的是 HomeKit 的 Active 特征，HA 会把它翻成
     # media_player.turn_on / turn_off（不会抛 homekit_tv_remote_key_pressed 事件）。
-    # 这两个方法以前用 `if self._state != STATE_OFF/STATE_ON` 做守卫，但本集成的
-    # 状态是"轮询 6095 端口通不通"猜出来的、恒为 playing，一旦猜错就会把按键整个
-    # 吞掉（用户按了电源键却什么都没发生），所以这里改成**无条件发 power**。
-    # power 是翻转键（开着就关、关着就开），所以两个方向都发同一个键是对的。
+    #
+    # ⚠️ 两个方向**不能**都发 power，虽然 power 是翻转键。
+    # 原因：HomeKit 调 turn_on 有两种完全不同的场景，从实体侧区分不了 ——
+    #   (a) 用户按电源键，真的想开机；
+    #   (b) iOS 认为这台电视"关着"，于是你在按**任意**遥控器按键（哪怕是方向键）时，
+    #       它先补一个 Active=1 把配件"唤醒" —— 而这时电视其实是开着的。
+    # 场景 (b) 下发 power 就会把刚打开的电视关掉，
+    # 表现就是「打开电视后第一次按遥控器，电视自己关机了」（2026-09-14 实测的 bug）。
+    #
+    # 而且这两种场景在协议层**没法区分**：判断不了真实开关机
+    # （待机时 6095 端口照样在线，见 docs/mitv-6095-api.md 第五节）。
+    # 所以只有"关"这个方向能发按键，"开"这个方向只能交给外部
+    # （拿下面 fire_event('on') 抛的 xiaomi_tv 事件去接智能插座/小爱）。
     async def async_turn_off(self):
         self._state = STATE_OFF
         _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
@@ -215,9 +221,11 @@ class XiaomiTV(MediaPlayerEntity):
         self.fire_event('off')
 
     async def async_turn_on(self):
+        # 这里**故意不发 power**（理由见上面）。只把状态置成 on 并抛事件，
+        # 状态置 on 还有个副作用是让 HomeKit 的 Active 立刻变 1，
+        # iOS 就不会再重复发"唤醒"写入。
         self._state = STATE_ON
-        _LOGGER.warning('[调试] 收到电源键 -> turn_on，发送 keyevent power')
-        await keyevent(self.ip, 'power')
+        _LOGGER.warning('[调试] 收到电源键 -> turn_on（按设计不发按键）')
         self.fire_event('on')
 
     # 发送事件
@@ -295,57 +303,45 @@ class XiaomiTV(MediaPlayerEntity):
     async def async_media_previous_track(self):
         await keyevent(self.ip, 'left')
 
-    # 更新属性
+    # 轮询只用来刷新「数据」：应用列表、扩展服务（DLNA/ADB）、截图。
+    #
+    # ⚠️ 这里**不再推断开关状态**（原来靠 check_port(6095) 判断在线，再把 _state
+    # 推成 playing / off）。原因：协议层根本判断不了真实开关机 —— 电视待机时
+    # 6095 端口照样在线、请求照样 success（见 docs/mitv-6095-api.md 第五节）。
+    # 猜错的后果不只是显示不对：HomeKit 的 Active 会跟着错，
+    # 进而触发 iOS「第一次操作遥控器时补发 Active=1」的行为。
+    #
+    # 现在 _state 只由我们自己的动作维护，别的什么都不改它：
+    #   async_turn_on()                    -> STATE_ON
+    #   async_turn_off()                   -> STATE_OFF
+    #   async_media_play() / _pause()      -> STATE_PLAYING / STATE_PAUSED
+    # 电视真实的开关机状态不可知，这也是 assumed_state = True 的意思。
     async def async_update(self):
-        # 检测当前IP是否在线
-        if check_port(self.ip, 6095):
-            self.fail_count = 0
-        else:
-            self.fail_count = self.fail_count + 1
-        
-        app_len = len(self.app_list)
-        if self.fail_count == 0:
-            self._state = STATE_PLAYING
-            # 同步DLNA状态
-            if self.dlna.state != STATE_UNAVAILABLE:
-                self._state = self.dlna.state
-            # 根据应用列表数量，判断是否初次更新
-            if app_len == 0:
-                # 获取应用列表
-                app_info = await getinstalledapp(self.ip)
-                if app_info is not None:
-                    for app in app_info:
-                        self.apps.update({ app['AppName']: app['PackageName'] })
+        # 根据应用列表数量，判断是否初次更新
+        if len(self.app_list) == 0:
+            # 获取应用列表
+            app_info = await getinstalledapp(self.ip)
+            if app_info is not None:
+                for app in app_info:
+                    self.apps.update({ app['AppName']: app['PackageName'] })
 
-                # 绑定视频源
-                for mode in self._sound_mode_list:
-                    self.apps.update({ mode.upper(): mode })
+            # 绑定视频源
+            for mode in self._sound_mode_list:
+                self.apps.update({ mode.upper(): mode })
 
-                # 绑定数据源
-                _source_list = []
-                for name in self.apps:
-                    _source_list.append(name)
-                self.app_list = self._source_list = _source_list
-            # 调整扩展服务更新时间
-            if self.update_at is None or (datetime.datetime.now() - self.update_at).seconds > 20:
-                self.update_at = datetime.datetime.now()
-                await self.dlna.async_update()
-                await self.adb.async_update()
-            # 获取截图
-            res = await capturescreen(self.ip)
-            if res is not None:
-                self._attr_media_image_url = res['url']
-                self._attr_app_id = res['id']
-                self._attr_app_name = res['name']
-
-            self.is_alive = True
-        elif self.fail_count >= 2:
-            self.fail_count = 2
-            self.is_alive = False
-            self._state = STATE_OFF
-            self._attr_media_image_url = None
-            if app_len > 0:
-                self.app_list = []
-            # 关闭服务
-            await self.adb.async_turn_off()
-            await self.dlna.async_turn_off()
+            # 绑定数据源
+            _source_list = []
+            for name in self.apps:
+                _source_list.append(name)
+            self.app_list = self._source_list = _source_list
+        # 调整扩展服务更新时间
+        if self.update_at is None or (datetime.datetime.now() - self.update_at).seconds > 20:
+            self.update_at = datetime.datetime.now()
+            await self.dlna.async_update()
+            await self.adb.async_update()
+        # 获取截图（电视不可达时拿不到，保留上一次的图，不清空 —— 避免网络抖动导致缩略图闪）
+        res = await capturescreen(self.ip)
+        if res is not None:
+            self._attr_media_image_url = res['url']
+            self._attr_app_id = res['id']
+            self._attr_app_name = res['name']
