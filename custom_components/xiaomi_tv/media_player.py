@@ -72,12 +72,11 @@ class XiaomiTV(MediaPlayerEntity):
         self._volume_level = 1
         self._is_volume_muted = False
         # ⚠️ 初始值不能是 off。HA 的 HomeKit 用
-        #   `state in (off, unknown, standby, "None")` 决定 Active 特征；
-        # 一旦报成 off，iOS 就会在你按**任意**遥控器按键前先补一个 Active=1
-        # 来"唤醒"配件（而电视往往开着），那个写入会让我们发一次 power，
-        # 把刚打开的电视关掉。
-        # 保持 Active 恒为 1，这个"唤醒"写入就不会发生，
-        # 电源键的 turn_on 也就只可能来自电源键本身。详见下面电源键那一段。
+        #   `state in (off, unknown, standby, "None")` 决定 Active 特征，
+        # 报成 off 就会让 iOS 下一次按电源键发 Active=1 → turn_on，
+        # 而 turn_on 按设计不发按键（见下面 async_turn_on 的说明），
+        # 于是"每隔一次按电源键就没反应"。保持非 off 才能让每次按键都走
+        # turn_off → 发 power。
         self._state = STATE_ON
         self._source_list = []
         self._sound_mode_list = ['hdmi1', 'hdmi2', 'hdmi3', 'gallery', 'aux', 'tv', 'vga', 'av', 'dtmb', 'adb']
@@ -209,39 +208,37 @@ class XiaomiTV(MediaPlayerEntity):
     # iOS 遥控器/家庭 App 的电源键走的是 HomeKit 的 Active 特征，HA 会把它翻成
     # media_player.turn_on / turn_off（不会抛 homekit_tv_remote_key_pressed 事件）。
     #
-    # 实测出来的两条事实（2026-09-14，靠观察反推出来的，不是猜）：
+    # ⚠️ 两个方向**不能**都发 power，虽然 power 是翻转键。
+    # 原因：HomeKit 调 turn_on 有两种完全不同的场景，从实体侧区分不了 ——
+    #   (a) 用户按电源键，真的想开机；
+    #   (b) iOS 认为这台电视"关着"，于是你在按**任意**遥控器按键（哪怕是方向键）时，
+    #       它先补一个 Active=1 把配件"唤醒" —— 而这时电视其实是开着的。
+    # 场景 (b) 下发 power 就会把刚打开的电视关掉，
+    # 表现就是「打开电视后第一次按遥控器，电视自己关机了」（2026-09-14 实测的 bug）。
     #
-    # ① **遥控器的电源键永远写 `Active = 1`**（它是"唤醒/开机"语义，不是取反的开关）。
-    #    证据：`turn_on` 里发 power 的版本"能开机"→ 说明 turn_on 确实被调用；
-    #    把 turn_on 改成静默后"开机关机都不行"→ 说明信号只剩这一条路。
-    #    ⇒ 所以**必须**在 async_turn_on 里把 power 发出去，否则这个键完全没反应。
+    # 而且这两种场景在协议层**没法区分**：判断不了真实开关机
+    # （待机时 6095 端口照样在线，见 docs/mitv-6095-api.md 第五节）。
+    # 所以只有"关"这个方向能发按键，"开"这个方向只能交给外部
+    # （拿下面 fire_event('on') 抛的 xiaomi_tv 事件去接智能插座/小爱）。
     #
-    # ② iOS 只要认为配件是 off，就会在你按**任意**遥控器按键（连方向键都算）之前
-    #    先补一个 `Active = 1` 把配件"唤醒"。这时电视往往开着，发 power（翻转键）
-    #    就会把它关掉 —— 这就是 2026-09-14 那个"打开电视后第一次按遥控器，
-    #    电视自己关机了"的 bug。
-    #    ⇒ 唯一解法是**永远不让 Active 变成 0**（见下面"永远不能报 off"），
-    #      这样 iOS 永远不会补发这个"唤醒"写入，turn_on 就只可能来自电源键本身。
-    #
-    # 两条合起来：Active 恒为 1 + turn_on/turn_off 都发 power
-    #           = 每次按电源键恰好发一次 keyevent&keycode=power → 电视翻转。
-    #
-    # ⚠️ 因此这个实体**永远不能把状态报成 off**
-    # （off / unknown / standby / "None" 都会让 Active 变 0）：
-    # 一旦报成 off，iOS 就开始补发"唤醒"写入（见 ②），把刚开的电视关掉。
-    # 所以 __init__ 的初始值是 STATE_ON，async_turn_off 也不改 _state。
-    # （原来每 30s 的轮询恰好一直把状态刷回 playing，掩盖了这件事；轮询删掉后暴露。）
+    # ⚠️ 由此推出第二条规则：**这个实体永远不能把状态报成 off**
+    # （off / unknown / standby 都会让 Active 变 0）。因为一旦报成 off，
+    # iOS 下一次按电源键发的是 Active=1 → turn_on，而 turn_on 按设计不发按键
+    # → 症状是"每隔一次按电源键就没反应"。保持 Active 恒为 1，
+    # 每次按电源键才会走 turn_off → 发 power → 电视翻转。
+    # （原来靠每 30s 轮询把状态刷回 playing 掩盖了这个问题，轮询删掉后就暴露了。）
     async def async_turn_off(self):
-        # 只发按键，**不动 _state**（保持非 off，理由见上）
+        # 只发按键，**不动 _state**（理由见上面第二条规则）
         _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
         await keyevent(self.ip, 'power')
         self.fire_event('off')
 
     async def async_turn_on(self):
-        # 必须发按键：遥控器的电源键只会走到这里（见上面事实 ①）
+        # 这里**故意不发 power**（理由见上面）。只把状态置成 on 并抛事件，
+        # 状态置 on 还有个副作用是让 HomeKit 的 Active 立刻变 1，
+        # iOS 就不会再重复发"唤醒"写入。
         self._state = STATE_ON
-        _LOGGER.warning('[调试] 收到电源键 -> turn_on，发送 keyevent power')
-        await keyevent(self.ip, 'power')
+        _LOGGER.warning('[调试] 收到电源键 -> turn_on（按设计不发按键）')
         self.fire_event('on')
 
     # 发送事件
