@@ -7,12 +7,16 @@ from homeassistant.config_entries import ConfigFlow, OptionsFlow, ConfigEntry
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, CONF_POWER_ENTITY
+from .const import DOMAIN, CONF_POWER_ENTITY, CONF_TV_ENTITY
 from homeassistant.components import zeroconf
 from .discovery import AsyncXiaomiTVScanner
 
-# 下拉里表示「不使用外部开关」的值（空串，不要改成 None）
+# 下拉里表示「不使用」的值（空串，不要改成 None）
 NO_POWER_ENTITY = ""
+NO_TV_ENTITY = ""
+
+# 可作为「开关机状态源」的实体域（xiaomihome 的音箱模式可能是 switch 或 binary_sensor）
+_POWER_DOMAINS = ("switch", "binary_sensor", "input_boolean")
 
 class XiaomiConfigFlow(ConfigFlow, domain=DOMAIN):
 

@@ -247,20 +247,25 @@ class XiaomiTV(MediaPlayerEntity):
     # （开关本身已经把电源动作做了，再发一次 power 等于翻转两次 = 没反应）：
     #       关机 -> switch.turn_on  （开关为 on  = 电视关机）
     #       开机 -> switch.turn_off （开关为 off = 电视开机）
+    # 唯一要特殊处理的是 turn_on：iOS 电源键在电视开着时按下也走 turn_on，
+    # 那种情况要翻转开关（见 async_turn_on 里的注释），否则电源键按了没反应。
     #
     # 没配开关时才退回老路子：turn_off 发 power；turn_on **故意不发按键** ——
     # 那种情况下状态是猜的，HomeKit 会在你按任意键时补发 Active=1（turn_on），
     # 此时发 power 会把开着的电视关掉（2026-09-14 实测的 bug）。
-    async def _async_set_power(self, tv_on):
-        ''' 直接操作状态开关：tv_on=True 表示要开机 '''
-        if POWER_ENTITY_INVERTED:
-            service = 'turn_off' if tv_on else 'turn_on'
-        else:
-            service = 'turn_on' if tv_on else 'turn_off'
+    async def _async_call_switch(self, service):
         _LOGGER.warning(f'[调试] 收到电源键 -> switch.{service} {self._power_entity}')
         await self.hass.services.async_call('switch', service, {
             'entity_id': self._power_entity
         }, blocking=True)
+
+    async def _async_set_power(self, tv_on):
+        ''' 直接把开关打到某一侧：tv_on=True 表示要开机 '''
+        if POWER_ENTITY_INVERTED:
+            service = 'turn_off' if tv_on else 'turn_on'
+        else:
+            service = 'turn_on' if tv_on else 'turn_off'
+        await self._async_call_switch(service)
 
     async def async_turn_off(self):
         self._state = STATE_OFF
@@ -268,16 +273,23 @@ class XiaomiTV(MediaPlayerEntity):
             _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
             await keyevent(self.ip, 'power')
         else:
-            # 打开开关 = 电视关机，不用再做别的
+            # 打开开关 = 电视关机，不用再做别的（开关已经是关着时也不会误翻转）
             await self._async_set_power(False)
         self.fire_event('off')
 
     async def async_turn_on(self):
+        # 先记下开关同步过来的真实状态，下面要用它判断这次 turn_on 到底是"开机"还是"翻转"
+        was_on = self._state == STATE_ON
         self._state = STATE_ON
         if self._power_entity is None:
             _LOGGER.warning('[调试] 收到电源键 -> turn_on（未配状态开关，按设计不发按键）')
+        elif was_on:
+            # ⚠️ iOS 遥控器的电源键写的是 Active=1，电视**开着**时按下也走 turn_on
+            # （它不是一个取反的开关，实测只写 1）。所以「已经开着 + 收到 turn_on」
+            # 只能是用户在按电源键想关机 —— 翻转开关，电视就关了。
+            await self._async_call_switch('toggle')
         else:
-            # 关闭开关 = 电视开机
+            # 确实关着 -> 明确开机
             await self._async_set_power(True)
         self.fire_event('on')
 
