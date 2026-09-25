@@ -3,8 +3,9 @@ import logging
 import time, datetime
 
 from homeassistant.components import media_source
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.storage import STORAGE_DIR
 from homeassistant.components.media_player import (
@@ -25,7 +26,7 @@ from homeassistant.const import (
 )
 
 from .manifest import manifest
-from .const import DOMAIN
+from .const import DOMAIN, CONF_POWER_ENTITY
 from .utils import keyevent, startapp, getsysteminfo, changesource, getinstalledapp, capturescreen, open_app
 from .dlna import MediaDLNA
 from .adb import MediaADB
@@ -56,17 +57,21 @@ async def async_setup_entry(
     config = entry.options
     host = config.get('ip')
     name = config.get(CONF_NAME)
+    # 外部状态开关：选了之后，开关机状态只由它决定
+    power_entity = config.get(CONF_POWER_ENTITY)
     if host is not None:
-        async_add_entities([XiaomiTV(entry.entry_id, host, name)], True)
+        async_add_entities([XiaomiTV(entry.entry_id, host, name, power_entity)], True)
 
 class XiaomiTV(MediaPlayerEntity):
     """Represent the Xiaomi TV for Home Assistant."""
 
-    def __init__(self, entry_id, ip, name):
+    def __init__(self, entry_id, ip, name, power_entity=None):
         
         self._attr_unique_id = entry_id
     
         self.ip = ip
+        # 判断开关机用的外部 switch 实体（None/空 = 没配，状态由集成自己维护）
+        self._power_entity = power_entity or None
         self._attr_name = name
         self._attr_media_title = name
         self._volume_level = 1
@@ -123,7 +128,39 @@ class XiaomiTV(MediaPlayerEntity):
     @property
     def assumed_state(self):
         """Indicate that state is assumed."""
-        return True
+        # 配了外部开关后状态是实测值，不再是猜的
+        return self._power_entity is None
+
+    # ── 开关机状态：只认外部开关 ────────────────────────────────────────────
+    # 协议层判断不了真实的开关机（电视待机时 6095 端口照样在线、请求照样 success，
+    # 见 docs/mitv-6095-api.md 第五节），所以如果有人在集成选项里选了一个 switch，
+    # 开关机状态就完全由那个 switch 决定，其它任何来源都不改状态。
+    #
+    # ⚠️ 这个 switch 是**反着接**的：
+    #     switch 为 on  -> 电视关机
+    #     switch 为 off -> 电视开机
+    # （常见于「检测到电流/信号才置位」的那类开关，这里按反逻辑映射。）
+    def _sync_power_state(self):
+        if self._power_entity is None:
+            return
+        state = self.hass.states.get(self._power_entity)
+        # 开关自身 unavailable / unknown 时不改状态，沿用上一次的已知值
+        if state is None or state.state in (STATE_UNAVAILABLE, 'unknown'):
+            return
+        self._state = STATE_OFF if state.state == STATE_ON else STATE_ON
+
+    @callback
+    def _async_power_entity_changed(self, event):
+        ''' 外部开关变了就立刻刷新状态 '''
+        self._sync_power_state()
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self):
+        if self._power_entity is not None:
+            self._sync_power_state()
+            self.async_on_remove(async_track_state_change_event(
+                self.hass, [self._power_entity], self._async_power_entity_changed
+            ))
 
     @property
     def sound_mode_list(self):
@@ -202,18 +239,15 @@ class XiaomiTV(MediaPlayerEntity):
     # iOS 遥控器/家庭 App 的电源键走的是 HomeKit 的 Active 特征，HA 会把它翻成
     # media_player.turn_on / turn_off（不会抛 homekit_tv_remote_key_pressed 事件）。
     #
-    # ⚠️ 两个方向**不能**都发 power，虽然 power 是翻转键。
-    # 原因：HomeKit 调 turn_on 有两种完全不同的场景，从实体侧区分不了 ——
+    # ⚠️ 注意 HomeKit 调 turn_on 有两种场景，从实体侧区分不了：
     #   (a) 用户按电源键，真的想开机；
-    #   (b) iOS 认为这台电视"关着"，于是你在按**任意**遥控器按键（哪怕是方向键）时，
-    #       它先补一个 Active=1 把配件"唤醒" —— 而这时电视其实是开着的。
-    # 场景 (b) 下发 power 就会把刚打开的电视关掉，
-    # 表现就是「打开电视后第一次按遥控器，电视自己关机了」（2026-09-14 实测的 bug）。
+    #   (b) iOS 认为这台电视"关着"，你在按**任意**遥控器按键（哪怕方向键）时，
+    #       它先补一个 Active=1 把配件"唤醒" —— 而这时电视可能其实开着。
     #
-    # 而且这两种场景在协议层**没法区分**：判断不了真实开关机
-    # （待机时 6095 端口照样在线，见 docs/mitv-6095-api.md 第五节）。
-    # 所以只有"关"这个方向能发按键，"开"这个方向只能交给外部
-    # （拿下面 fire_event('on') 抛的 xiaomi_tv 事件去接智能插座/小爱）。
+    # 配了外部开关后状态是真实的，所以 (b) 只会在电视真的关着时发生，
+    # 两个方向发 power 都是对的 —— 这也是为什么下面 turn_on 也发按键。
+    # 没配开关时状态是猜的，turn_on 发 power 会把开着的电视关掉
+    # （2026-09-14 实测的 bug），所以那种情况下 turn_on 只改状态 + 抛事件。
     async def async_turn_off(self):
         self._state = STATE_OFF
         _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
@@ -221,11 +255,12 @@ class XiaomiTV(MediaPlayerEntity):
         self.fire_event('off')
 
     async def async_turn_on(self):
-        # 这里**故意不发 power**（理由见上面）。只把状态置成 on 并抛事件，
-        # 状态置 on 还有个副作用是让 HomeKit 的 Active 立刻变 1，
-        # iOS 就不会再重复发"唤醒"写入。
         self._state = STATE_ON
-        _LOGGER.warning('[调试] 收到电源键 -> turn_on（按设计不发按键）')
+        if self._power_entity is None:
+            _LOGGER.warning('[调试] 收到电源键 -> turn_on（未配状态开关，按设计不发按键）')
+        else:
+            _LOGGER.warning('[调试] 收到电源键 -> turn_on，发送 keyevent power')
+            await keyevent(self.ip, 'power')
         self.fire_event('on')
 
     # 发送事件
@@ -283,14 +318,17 @@ class XiaomiTV(MediaPlayerEntity):
     async def async_media_play(self):
         result = await self.dlna.async_media_play()
         if result:
-            self._state = STATE_PLAYING
+            # 配了外部开关时开关机状态只认开关，这里不能改
+            if self._power_entity is None:
+                self._state = STATE_PLAYING
         else:
             await keyevent(self.ip, 'home')
 
     async def async_media_pause(self):
         result = await self.dlna.async_media_pause()
         if result:
-            self._state = STATE_PAUSED
+            if self._power_entity is None:
+                self._state = STATE_PAUSED
         else:
             await keyevent(self.ip, 'home')
 
@@ -311,12 +349,17 @@ class XiaomiTV(MediaPlayerEntity):
     # 猜错的后果不只是显示不对：HomeKit 的 Active 会跟着错，
     # 进而触发 iOS「第一次操作遥控器时补发 Active=1」的行为。
     #
-    # 现在 _state 只由我们自己的动作维护，别的什么都不改它：
-    #   async_turn_on()                    -> STATE_ON
-    #   async_turn_off()                   -> STATE_OFF
-    #   async_media_play() / _pause()      -> STATE_PLAYING / STATE_PAUSED
-    # 电视真实的开关机状态不可知，这也是 assumed_state = True 的意思。
+    # 开关机状态的两个来源，按优先级：
+    #   1. 配了外部 switch（集成选项里选的）-> 只认它，通常靠状态变化事件即时刷新，
+    #      这里的同步只是兜底；
+    #   2. 没配 switch -> _state 只由我们自己的动作维护：
+    #        async_turn_on()  -> STATE_ON
+    #        async_turn_off() -> STATE_OFF
+    #        async_media_play() / _pause() -> STATE_PLAYING / STATE_PAUSED
+    #      电视真实的开关机状态不可知，这也是 assumed_state = True 的意思。
     async def async_update(self):
+        # 开关机状态：只从外部开关同步（没配则什么都不做）
+        self._sync_power_state()
         # 根据应用列表数量，判断是否初次更新
         if len(self.app_list) == 0:
             # 获取应用列表
