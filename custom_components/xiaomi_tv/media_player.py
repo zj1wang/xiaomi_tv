@@ -26,7 +26,7 @@ from homeassistant.const import (
 )
 
 from .manifest import manifest
-from .const import DOMAIN, CONF_POWER_ENTITY
+from .const import DOMAIN, CONF_POWER_ENTITY, DEFAULT_POWER_ENTITY, POWER_ENTITY_INVERTED
 from .utils import keyevent, startapp, getsysteminfo, changesource, getinstalledapp, capturescreen, open_app
 from .dlna import MediaDLNA
 from .adb import MediaADB
@@ -58,7 +58,8 @@ async def async_setup_entry(
     host = config.get('ip')
     name = config.get(CONF_NAME)
     # 外部状态开关：选了之后，开关机状态只由它决定
-    power_entity = config.get(CONF_POWER_ENTITY)
+    # const.py 里写死的 DEFAULT_POWER_ENTITY 优先级最高，其次才是选项里选的
+    power_entity = DEFAULT_POWER_ENTITY or config.get(CONF_POWER_ENTITY)
     if host is not None:
         async_add_entities([XiaomiTV(entry.entry_id, host, name, power_entity)], True)
 
@@ -136,7 +137,7 @@ class XiaomiTV(MediaPlayerEntity):
     # 见 docs/mitv-6095-api.md 第五节），所以如果有人在集成选项里选了一个 switch，
     # 开关机状态就完全由那个 switch 决定，其它任何来源都不改状态。
     #
-    # ⚠️ 这个 switch 是**反着接**的：
+    # ⚠️ 这个 switch 是**反着接**的（POWER_ENTITY_INVERTED = True）：
     #     switch 为 on  -> 电视关机
     #     switch 为 off -> 电视开机
     # （常见于「检测到电流/信号才置位」的那类开关，这里按反逻辑映射。）
@@ -147,7 +148,9 @@ class XiaomiTV(MediaPlayerEntity):
         # 开关自身 unavailable / unknown 时不改状态，沿用上一次的已知值
         if state is None or state.state in (STATE_UNAVAILABLE, 'unknown'):
             return
-        self._state = STATE_OFF if state.state == STATE_ON else STATE_ON
+        switch_on = state.state == STATE_ON
+        # 反逻辑：开关开着说明电视关着；正逻辑则一致
+        self._state = STATE_OFF if (switch_on == POWER_ENTITY_INVERTED) else STATE_ON
 
     @callback
     def _async_power_entity_changed(self, event):
@@ -239,19 +242,34 @@ class XiaomiTV(MediaPlayerEntity):
     # iOS 遥控器/家庭 App 的电源键走的是 HomeKit 的 Active 特征，HA 会把它翻成
     # media_player.turn_on / turn_off（不会抛 homekit_tv_remote_key_pressed 事件）。
     #
-    # ⚠️ 注意 HomeKit 调 turn_on 有两种场景，从实体侧区分不了：
-    #   (a) 用户按电源键，真的想开机；
-    #   (b) iOS 认为这台电视"关着"，你在按**任意**遥控器按键（哪怕方向键）时，
-    #       它先补一个 Active=1 把配件"唤醒" —— 而这时电视可能其实开着。
+    # 这个 switch 既是「状态源」也是「执行器」：把开关打到某一侧，电视就真的开/关了。
+    # 所以配了开关后，开关机只操作这个开关，**不再发 power 按键**
+    # （开关本身已经把电源动作做了，再发一次 power 等于翻转两次 = 没反应）：
+    #       关机 -> switch.turn_on  （开关为 on  = 电视关机）
+    #       开机 -> switch.turn_off （开关为 off = 电视开机）
     #
-    # 配了外部开关后状态是真实的，所以 (b) 只会在电视真的关着时发生，
-    # 两个方向发 power 都是对的 —— 这也是为什么下面 turn_on 也发按键。
-    # 没配开关时状态是猜的，turn_on 发 power 会把开着的电视关掉
-    # （2026-09-14 实测的 bug），所以那种情况下 turn_on 只改状态 + 抛事件。
+    # 没配开关时才退回老路子：turn_off 发 power；turn_on **故意不发按键** ——
+    # 那种情况下状态是猜的，HomeKit 会在你按任意键时补发 Active=1（turn_on），
+    # 此时发 power 会把开着的电视关掉（2026-09-14 实测的 bug）。
+    async def _async_set_power(self, tv_on):
+        ''' 直接操作状态开关：tv_on=True 表示要开机 '''
+        if POWER_ENTITY_INVERTED:
+            service = 'turn_off' if tv_on else 'turn_on'
+        else:
+            service = 'turn_on' if tv_on else 'turn_off'
+        _LOGGER.warning(f'[调试] 收到电源键 -> switch.{service} {self._power_entity}')
+        await self.hass.services.async_call('switch', service, {
+            'entity_id': self._power_entity
+        }, blocking=True)
+
     async def async_turn_off(self):
         self._state = STATE_OFF
-        _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
-        await keyevent(self.ip, 'power')
+        if self._power_entity is None:
+            _LOGGER.warning('[调试] 收到电源键 -> turn_off，发送 keyevent power')
+            await keyevent(self.ip, 'power')
+        else:
+            # 打开开关 = 电视关机，不用再做别的
+            await self._async_set_power(False)
         self.fire_event('off')
 
     async def async_turn_on(self):
@@ -259,8 +277,8 @@ class XiaomiTV(MediaPlayerEntity):
         if self._power_entity is None:
             _LOGGER.warning('[调试] 收到电源键 -> turn_on（未配状态开关，按设计不发按键）')
         else:
-            _LOGGER.warning('[调试] 收到电源键 -> turn_on，发送 keyevent power')
-            await keyevent(self.ip, 'power')
+            # 关闭开关 = 电视开机
+            await self._async_set_power(True)
         self.fire_event('on')
 
     # 发送事件
